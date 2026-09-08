@@ -56,7 +56,7 @@ from solidlsp.lsp_protocol_handler.server import (
     StringDict,
 )
 from solidlsp.settings import SolidLSPSettings
-from solidlsp.util.cache import load_cache, save_cache
+from solidlsp.util.symbol_cache import LazyFileCache, import_pickle_cache
 
 RawDocumentSymbol = Union[DocumentSymbol, SymbolInformation]
 """
@@ -354,8 +354,9 @@ class SolidLanguageServer(ABC):
     If the result of a language server changes in a way that affects the raw document symbols,
     the LS-specific version should be incremented instead.
     """
-    RAW_DOCUMENT_SYMBOL_CACHE_FILENAME = "raw_document_symbols.pkl"
-    RAW_DOCUMENT_SYMBOL_CACHE_FILENAME_LEGACY_FALLBACK = "document_symbols_cache_v23-06-25.pkl"
+    RAW_DOCUMENT_SYMBOL_CACHE_DB_FILENAME = "raw_document_symbols.db"
+    RAW_DOCUMENT_SYMBOL_CACHE_FILENAME_LEGACY_FALLBACK = "raw_document_symbols.pkl"
+    RAW_DOCUMENT_SYMBOL_CACHE_FILENAME_LEGACY_FALLBACK_2 = "document_symbols_cache_v23-06-25.pkl"
     DOCUMENT_SYMBOL_CACHE_VERSION = 4
     """
     defines the version of the high-level document symbol format.
@@ -363,7 +364,8 @@ class SolidLanguageServer(ABC):
     For changes that affect the symbols of a particular language server implementation (subclass),
     change :meth:`_document_symbols_cache_fingerprint` instead.
     """
-    DOCUMENT_SYMBOL_CACHE_FILENAME = "document_symbols.pkl"
+    DOCUMENT_SYMBOL_CACHE_DB_FILENAME = "document_symbols.db"
+    DOCUMENT_SYMBOL_CACHE_FILENAME_LEGACY_FALLBACK = "document_symbols.pkl"
 
     # Directories that should always be ignored regardless of language:
     # VCS internals, virtual environments, caches, and serena's own data.
@@ -552,12 +554,12 @@ class SolidLanguageServer(ABC):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         # * raw document symbols cache
         self._ls_specific_raw_document_symbols_cache_version = cache_version_raw_document_symbols
-        self._raw_document_symbols_cache: dict[str, tuple[str, list[DocumentSymbol] | list[SymbolInformation] | None]] = {}
+        self._raw_document_symbols_cache: LazyFileCache[tuple[str, list[DocumentSymbol] | list[SymbolInformation] | None]]
         """maps relative file paths to a tuple of (file_content_hash, raw_root_symbols)"""
         self._raw_document_symbols_cache_is_modified: bool = False
         self._load_raw_document_symbols_cache()
         # * high-level document symbols cache
-        self._document_symbols_cache: dict[str, tuple[str, DocumentSymbols]] = {}
+        self._document_symbols_cache: LazyFileCache[tuple[str, DocumentSymbols]]
         """maps relative file paths to a tuple of (file_content_hash, document_symbols)"""
         self._document_symbols_cache_is_modified: bool = False
         self._load_document_symbols_cache()
@@ -2992,22 +2994,17 @@ class SolidLanguageServer(ABC):
         return version[0] if len(version) == 1 else tuple(version)
 
     def _save_raw_document_symbols_cache(self) -> None:
-        cache_file = self.cache_dir / self.RAW_DOCUMENT_SYMBOL_CACHE_FILENAME
-
         if not self._raw_document_symbols_cache_is_modified:
             log.debug("No changes to raw document symbols cache, skipping save")
             return
 
+        cache_file = self._raw_document_symbols_cache.path
         log.info("Saving updated raw document symbols cache to %s", cache_file)
         try:
-            save_cache(str(cache_file), self._raw_document_symbols_cache_version(), self._raw_document_symbols_cache)
+            self._raw_document_symbols_cache.save()
             self._raw_document_symbols_cache_is_modified = False
         except Exception as e:
-            log.error(
-                "Failed to save raw document symbols cache to %s: %s. Note: this may have resulted in a corrupted cache file.",
-                cache_file,
-                e,
-            )
+            log.error("Failed to save raw document symbols cache to %s: %s", cache_file, e)
 
     def _raw_document_symbols_cache_fingerprint(self) -> Hashable | None:
         """
@@ -3040,84 +3037,68 @@ class SolidLanguageServer(ABC):
         return base_version
 
     def _load_raw_document_symbols_cache(self) -> None:
-        cache_file = self.cache_dir / self.RAW_DOCUMENT_SYMBOL_CACHE_FILENAME
+        version = self._raw_document_symbols_cache_version()
+        self._raw_document_symbols_cache = LazyFileCache(self.cache_dir / self.RAW_DOCUMENT_SYMBOL_CACHE_DB_FILENAME, version)
 
-        if not cache_file.exists():
-            # check for legacy cache to load to migrate
-            legacy_cache_file = self.cache_dir / self.RAW_DOCUMENT_SYMBOL_CACHE_FILENAME_LEGACY_FALLBACK
-            if legacy_cache_file.exists():
-                try:
-                    legacy_cache: dict[
-                        str, tuple[str, tuple[list[ls_types.UnifiedSymbolInformation], list[ls_types.UnifiedSymbolInformation]]]
-                    ] = load_pickle(legacy_cache_file)
-                    log.info("Migrating legacy document symbols cache with %d entries", len(legacy_cache))
-                    num_symbols_migrated = 0
-                    migrated_cache = {}
-                    for cache_key, (file_hash, (all_symbols, root_symbols)) in legacy_cache.items():
-                        if cache_key.endswith("-True"):  # include_body=True
-                            new_cache_key = cache_key[:-5]
-                            migrated_cache[new_cache_key] = (file_hash, root_symbols)
-                            num_symbols_migrated += len(all_symbols)
-                    log.info("Migrated %d document symbols from legacy cache", num_symbols_migrated)
-                    self._raw_document_symbols_cache = migrated_cache
-                    self._raw_document_symbols_cache_is_modified = True
-                    self._save_raw_document_symbols_cache()
-                    legacy_cache_file.unlink()
-                    return
-                except Exception as e:
-                    log.error("Error during cache migration: %s", e)
-                    return
+        # import a legacy cache which held all entries in a single pickled dict (if any)
+        legacy_cache_file = self.cache_dir / self.RAW_DOCUMENT_SYMBOL_CACHE_FILENAME_LEGACY_FALLBACK
+        if legacy_cache_file.exists():
+            import_pickle_cache(legacy_cache_file, self._raw_document_symbols_cache, version)
+        else:
+            self._migrate_raw_document_symbols_cache_v23_06_25()
 
-        # load existing cache (if any)
-        if cache_file.exists():
-            log.info("Loading document symbols cache from %s", cache_file)
-            try:
-                saved_cache = load_cache(str(cache_file), self._raw_document_symbols_cache_version())
-                if saved_cache is not None:
-                    self._raw_document_symbols_cache = saved_cache
-                    log.info(f"Loaded {len(self._raw_document_symbols_cache)} entries from raw document symbols cache.")
-            except Exception as e:
-                # cache can become corrupt, so just skip loading it
-                log.warning(
-                    "Failed to load raw document symbols cache from %s (%s); Ignoring cache.",
-                    cache_file,
-                    e,
-                )
+        log.info(
+            "Raw document symbols cache %s holds %d entries", self._raw_document_symbols_cache.path, len(self._raw_document_symbols_cache)
+        )
+
+    def _migrate_raw_document_symbols_cache_v23_06_25(self) -> None:
+        """
+        Migrates the oldest known cache format, in which entries additionally were keyed by the
+        `include_body` flag and held both all symbols and the root symbols, into the current cache.
+        """
+        legacy_cache_file = self.cache_dir / self.RAW_DOCUMENT_SYMBOL_CACHE_FILENAME_LEGACY_FALLBACK_2
+        if not legacy_cache_file.exists():
+            return
+        try:
+            legacy_cache: dict[str, tuple[str, tuple[list[ls_types.UnifiedSymbolInformation], list[ls_types.UnifiedSymbolInformation]]]] = (
+                load_pickle(legacy_cache_file)
+            )
+            log.info("Migrating legacy document symbols cache with %d entries", len(legacy_cache))
+            num_symbols_migrated = 0
+            for cache_key, (file_hash, (all_symbols, root_symbols)) in legacy_cache.items():
+                if cache_key.endswith("-True"):  # include_body=True
+                    new_cache_key = cache_key[:-5]
+                    self._raw_document_symbols_cache[new_cache_key] = (file_hash, root_symbols)
+                    num_symbols_migrated += len(all_symbols)
+            log.info("Migrated %d document symbols from legacy cache", num_symbols_migrated)
+            self._raw_document_symbols_cache.save()
+            legacy_cache_file.unlink()
+        except Exception as e:
+            log.error("Error during cache migration: %s", e)
 
     def _save_document_symbols_cache(self) -> None:
-        cache_file = self.cache_dir / self.DOCUMENT_SYMBOL_CACHE_FILENAME
-
         if not self._document_symbols_cache_is_modified:
             log.debug("No changes to document symbols cache, skipping save")
             return
 
+        cache_file = self._document_symbols_cache.path
         log.info("Saving updated document symbols cache to %s", cache_file)
         try:
-            save_cache(str(cache_file), self._document_symbols_cache_version(), self._document_symbols_cache)
+            self._document_symbols_cache.save()
             self._document_symbols_cache_is_modified = False
         except Exception as e:
-            log.error(
-                "Failed to save document symbols cache to %s: %s. Note: this may have resulted in a corrupted cache file.",
-                cache_file,
-                e,
-            )
+            log.error("Failed to save document symbols cache to %s: %s", cache_file, e)
 
     def _load_document_symbols_cache(self) -> None:
-        cache_file = self.cache_dir / self.DOCUMENT_SYMBOL_CACHE_FILENAME
-        if cache_file.exists():
-            log.info("Loading document symbols cache from %s", cache_file)
-            try:
-                saved_cache = load_cache(str(cache_file), self._document_symbols_cache_version())
-                if saved_cache is not None:
-                    self._document_symbols_cache = saved_cache
-                    log.info(f"Loaded {len(self._document_symbols_cache)} entries from document symbols cache.")
-            except Exception as e:
-                # cache can become corrupt, so just skip loading it
-                log.warning(
-                    "Failed to load document symbols cache from %s (%s); Ignoring cache.",
-                    cache_file,
-                    e,
-                )
+        version = self._document_symbols_cache_version()
+        self._document_symbols_cache = LazyFileCache(self.cache_dir / self.DOCUMENT_SYMBOL_CACHE_DB_FILENAME, version)
+
+        # import a legacy cache which held all entries in a single pickled dict (if any)
+        legacy_cache_file = self.cache_dir / self.DOCUMENT_SYMBOL_CACHE_FILENAME_LEGACY_FALLBACK
+        if legacy_cache_file.exists():
+            import_pickle_cache(legacy_cache_file, self._document_symbols_cache, version)
+
+        log.info("Document symbols cache %s holds %d entries", self._document_symbols_cache.path, len(self._document_symbols_cache))
 
     def save_cache(self) -> None:
         self._save_raw_document_symbols_cache()
@@ -3229,6 +3210,11 @@ class SolidLanguageServer(ABC):
             log.warning(f"Exception while shutting down language server: {e}")
         finally:
             self.server_started = False
+            for cache in (self._raw_document_symbols_cache, self._document_symbols_cache):
+                try:
+                    cache.close()
+                except Exception as e:
+                    log.warning(f"Exception while closing symbol cache {cache.path}: {e}")
 
     @property
     def language_server(self) -> Self:

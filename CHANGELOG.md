@@ -3,6 +3,14 @@
 Status of the `main` branch. Changes prior to the next official version change will appear here.
 
 * General:
+  - Improvement: The document symbol caches are no longer held in memory in their entirety. They are
+    stored as one record per file in an SQLite database and unpickled on access, with a bounded number
+    of recently used records retained, so resident memory now scales with the files a session actually
+    touches rather than with the size of the repository. On a large monorepo (1.4 GB of cached
+    symbols), a server's resident memory for the caches drops from ~5 GB to below 150 MB, and saving
+    the cache no longer rewrites every entry. Existing `.pkl` caches are imported once and then
+    deleted; oversized ones (>256 MB) are discarded and repopulated on demand, since loading them
+    requires more memory than the format they replace.
   - Fix: MCP `initialize` now reports Serena's version instead of the installed mcp SDK version (#1889)
   - Fix: Parallel agents auto-registering projects could overwrite each other's changes to the global
     project list in `serena_config.yml`
